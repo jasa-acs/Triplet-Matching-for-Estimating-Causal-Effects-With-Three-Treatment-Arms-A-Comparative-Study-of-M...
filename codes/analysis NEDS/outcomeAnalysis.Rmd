@@ -1,0 +1,454 @@
+---
+title: "Outcome Analysis of ``Triplet Matching for Estimating Causal Effects with Three Treatment Arms: A Comparative Study of Mortality by Trauma Center Level''"
+author: "Giovanni Nattino"
+date: "November 5, 2018"
+output: pdf_document
+---
+ 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Analysis of NEDS Data 
+
+Data preprocessing. 
+
+```{r}
+library(reshape2)
+library(survival)
+
+#Load matched data
+load("bestResult_3wayconstr_allData_1-2.Rdata")
+matchedDat <- result3wayConstr$matchedData[!is.na(result3wayConstr$matchedData$indexMatch),]
+
+#Data for evidence factor 1: NTC vs. TC
+matchedDat$NTC <- (matchedDat$HOSP_TRAUMA %in% c(0))*1
+matchedDat$TCI <- (matchedDat$HOSP_TRAUMA %in% c(1))*1
+
+table(matchedDat$NTC, matchedDat$ED_death, dnn = c("NTC","Mortality"))
+prop.table(table(matchedDat$NTC, matchedDat$ED_death, dnn = c("NTC","Mortality")),1)
+
+#Data for evidence factor 2: TCI vs. TCII
+matchedDat2 <- matchedDat[matchedDat$HOSP_TRAUMA %in% c(1,2),
+                                   c("indexMatch","TCI","ED_death")]
+matchedDatWide <- dcast(matchedDat2, 
+                        indexMatch ~ TCI , value.var = "ED_death")
+tab <- table(matchedDatWide[,"1"], matchedDatWide[,"0"], dnn = c("Outcome TCI", "Outcome TCII"))
+tab
+```
+
+Functions for sensitivity analysis.
+
+```{r}
+#Function implementing Rosenbaum's primal sensitivity analysis for McNemar's test
+primalSensAnalysisOneToOne <- function(data, exposure, outcome, indexMatch, Gamma) {
+  
+  tab2x2xS <- table(data[,exposure],
+                    data[,outcome],
+                    data[,indexMatch])
+  
+  nonExp_event <- apply(tab2x2xS, 3, FUN = "[", "0", "1")
+  nonExp_nonEvent <- apply(tab2x2xS, 3, FUN = "[", "0", "0")
+  exp_event <- apply(tab2x2xS, 3, FUN = "[", "1", "1")
+  exp_nonEvent <- apply(tab2x2xS, 3, FUN = "[", "1", "0")
+  
+  numDiscordant <- sum((nonExp_event==1 & exp_nonEvent==1) |
+                        (exp_event==1 & nonExp_nonEvent==1))
+  
+  mcNemarStat <- sum(exp_event==1 & nonExp_nonEvent==1)
+  
+  ps <- Gamma / (1 + Gamma)
+  stat <- (mcNemarStat - ps*numDiscordant)/sqrt(numDiscordant*ps*(1-ps))
+  pvalue <- 1 - pnorm(stat)
+  
+  return(list(stat = stat, 
+            pvalue = pvalue))
+}
+
+#Function implementing Rosenbaum's primal sensitivity analysis for MH test
+primalSensAnalysisOneToK <- function(data, exposure, outcome, indexMatch, Gamma) {
+  
+  tab2x2xS <- table(data[,exposure],
+                    data[,outcome],
+                    data[,indexMatch])
+  
+  nonExp_event <- apply(tab2x2xS, 3, FUN = "[", "0", "1")
+  nonExp_nonEvent <- apply(tab2x2xS, 3, FUN = "[", "0", "0")
+  exp_event <- apply(tab2x2xS, 3, FUN = "[", "1", "1")
+  exp_nonEvent <- apply(tab2x2xS, 3, FUN = "[", "1", "0")
+  
+  vect_m_s <- (nonExp_event + exp_event)
+  vect_n_s <- (nonExp_event + nonExp_nonEvent + exp_event + exp_nonEvent)
+  vect_p_s <- vect_m_s * Gamma / (Gamma * vect_m_s + vect_n_s - vect_m_s)
+  
+  mhStat <- sum(exp_event==1)
+  stat <- (mhStat - sum(vect_p_s))/sqrt(sum(vect_p_s*(1-vect_p_s)))
+  pvalue <- 1 - pnorm(stat)
+  
+  return(list(stat = stat,
+         pvalue = pvalue))
+}
+
+#Function implementing Rosenbaum's sensitivity analysis on Fisher's joint test
+sensAnalysisEvFactors <- function(data1, data2,
+                                  exposure1, exposure2,
+                                  outcome1, outcome2,
+                                  indexMatch1, indexMatch2, 
+                                  Gamma1, Gamma2) {
+  #Ev factor 1
+  res1 <- primalSensAnalysisOneToK(data = data1,
+                              exposure = exposure1,
+                              outcome = outcome1,
+                              indexMatch = indexMatch1,
+                              Gamma = Gamma1)
+   
+  #Ev factor 2
+  res2 <- primalSensAnalysisOneToOne(data = data2,
+                              exposure = exposure2,
+                              outcome = outcome2,
+                              indexMatch = indexMatch2,
+                              Gamma = Gamma2)
+  #Joint test with Fisher's method:
+  stat <- -2 * (log(res1$pvalue) + log(res2$pvalue) )
+  stat
+  
+  pvalue <- 1 - pchisq(stat, df = 2 * 2)
+  pvalue
+  
+  return(list(stat = stat,
+         pvalue = pvalue))
+}  
+
+#Make function accepting vectorial input
+sensAnalysisEvFactorsVect <- Vectorize(FUN = sensAnalysisEvFactors, 
+                                       vectorize.args = c("Gamma1","Gamma2"))
+
+#Fucntion to estimate the attributable effect
+attributableEffect <- function(data, exposure, outcome, indexMatch, Gamma, alpha = 0.05) {
+  
+  tab2x2xS <- table(data[,exposure],
+                    data[,outcome],
+                    data[,indexMatch])
+  
+  nonExp_event <- apply(tab2x2xS, 3, FUN = "[", "0", "1")
+  nonExp_nonEvent <- apply(tab2x2xS, 3, FUN = "[", "0", "0")
+  exp_event <- apply(tab2x2xS, 3, FUN = "[", "1", "1")
+  exp_nonEvent <- apply(tab2x2xS, 3, FUN = "[", "1", "0")
+  
+  S <- length(exp_event)
+  
+  #Assumed: only one treated subject per matched set
+  if (!all((exp_event+exp_nonEvent) == 1)) stop("Each matched set must have ONE treated/exposed subject")
+                                                
+  vect_m_s <- (nonExp_event + exp_event)
+  vect_n_s <- (nonExp_event + nonExp_nonEvent + exp_event + exp_nonEvent)
+  
+  #Expectation of MH stat 
+  vect_lambdaBarBar_s <- vect_m_s * Gamma / (Gamma * vect_m_s + vect_n_s - vect_m_s)
+  vect_lambdaBar_s <- (vect_m_s-1) * Gamma / (Gamma * (vect_m_s-1) + vect_n_s - (vect_m_s-1))
+  #If m_s=0 (no events in the matched set), lambdaBar_s < 0 => force to NA
+  vect_lambdaBar_s[vect_m_s == 0] <- NA
+  #Variance of MH stat 
+  vect_omegaBarBar_s <- vect_lambdaBarBar_s * (1-vect_lambdaBarBar_s)
+  vect_omegaBar_s <- vect_lambdaBar_s * (1-vect_lambdaBar_s)
+  
+  #In matched cohort studies, all the difference in the lambdas should be equal
+  indexesOrder <- order((vect_lambdaBarBar_s - vect_lambdaBar_s), 
+                        (vect_omegaBarBar_s - vect_omegaBar_s), na.last = TRUE)
+  
+  tot_exp_event <- sum(exp_event==1)
+  
+  if(tot_exp_event==0) {
+    
+    #If tot_exp_event=0, there are no events among the exposed. The exposure cannot be the cause of any event! 
+    A_lowerCi <- NA
+    pvalue <- NA
+  
+  } else {
+    
+    #a=0 (original test rejected or not)
+    vect_p_s <- vect_lambdaBarBar_s
+    
+    stat <- (tot_exp_event - sum(vect_p_s))/sqrt(sum(vect_p_s*(1-vect_p_s)))
+    pvalue <- 1 - pnorm(stat)
+    
+    if (pvalue < alpha) {
+      
+      for (a in 1:(tot_exp_event-1)) {
+        
+        vect_p_s <- c(vect_lambdaBar_s[indexesOrder][1:a], vect_lambdaBarBar_s[indexesOrder][(a+1):S])
+        stat <- (tot_exp_event - a - sum(vect_p_s))/sqrt(sum(vect_p_s*(1-vect_p_s)))
+        pvalue <- 1 - pnorm(stat)
+        if(pvalue >= alpha) {break}
+      }
+      A_lowerCi <- a
+      
+    } else {
+      
+      A_lowerCi <- 0
+      
+    }
+    
+  }
+  
+  return(list(A_lowerCi = A_lowerCi,
+              confLevel = 1-pvalue))
+}
+  
+```
+
+##Evidence Factor Analysis
+
+Two tests for two evidence factors:
+
+1. Mantel-Haenszel statistic to compare NTC vs. TC in 1:2 matched sample.
+2. McNemar's statistic to compare TCI vs. TCII in 1:1 matched sample.
+
+We can use the Fisher's method to combine the p-values.
+
+```{r}
+#MH test for evidence factor 1
+test1 <- mantelhaen.test(table(matchedDat$NTC, 
+                               matchedDat$ED_death, 
+                               matchedDat$indexMatch))
+test1
+
+#McNemar's test for evidence factor 2
+test2 <- mcnemar.test(tab)
+test2
+
+#Fisher's method to combine p-values:
+stat <- -2 * (log(test1$p.value) + log(test2$p.value) )
+stat
+
+pvalue <- 1 - pchisq(stat, df = 2 * 2)
+pvalue
+
+```
+
+These results are analogous to assuming $\Gamma_1=\Gamma_2=1$ in the sensitivity analysis.
+
+```{r}
+#Equivalent to MH test
+resultMH <- primalSensAnalysisOneToK(data = matchedDat,
+                          exposure = "NTC",
+                          outcome = "ED_death",
+                          indexMatch = "indexMatch",
+                          Gamma = 1)
+resultMH 
+   
+#Equivalent to McNemar's test
+resultMN <- primalSensAnalysisOneToOne(data = matchedDat2,
+                          exposure = "TCI",
+                          outcome = "ED_death",
+                          indexMatch = "indexMatch",
+                          Gamma = 1)
+resultMN
+
+#Equivalent to Fisher's method for joint test
+resultFisher <- sensAnalysisEvFactors(matchedDat, matchedDat2,
+                      "NTC", "TCI",
+                      "ED_death", "ED_death",
+                      "indexMatch", "indexMatch", 
+                      Gamma1 = 1, Gamma2 = 1) 
+resultFisher
+
+#The value of the MH statistic is very large and the corresponding p-value is very small 
+#(almost zero). To compute log(p-value of MH test), which is required to compute the 
+#combined p-value with Fisher's method, we need to use the option log = T of pnorm
+stat <- (- 2 * pnorm(resultMH$stat, lower.tail = F, log = T) - 2*log(resultMN$pvalue))
+pvalue <- 1 - pchisq(stat, df = 2 * 2)
+
+stat
+pvalue
+```
+
+Attributable effect:
+
+```{r}
+attrEffMH <- attributableEffect(data = matchedDat,
+                              exposure = "NTC",
+                              outcome = "ED_death",
+                              indexMatch = "indexMatch",
+                              Gamma = 1, alpha = 0.05)
+attrEffMH 
+
+
+tab <- table(matchedDat$ED_death,matchedDat$NTC, dnn = c("ED mortality","NTC"))
+tab
+
+#Risk in treatment groups
+risks <- prop.table(tab, 2)["1",]
+risks
+
+#Risk difference
+risks["1"]-risks["0"]
+
+#Onesided 95% CI - Attributable risk
+attrEffMH$A_lowerCi/length(unique(matchedDat$indexMatch))
+
+#The lower bound of the simultaneous two-sided CI for the RD was 0.041. 
+#What would be the corresponding lower bound with this method?
+#alpha = 0.025 for the two-sided and /3 for Bonferroni correction in the 3 CIs
+attrForComparison <- attributableEffect(data = matchedDat,
+                              exposure = "NTC",
+                              outcome = "ED_death",
+                              indexMatch = "indexMatch",
+                              Gamma = 1, alpha = 0.025/3) 
+attrForComparison$A_lowerCi/length(unique(matchedDat$indexMatch))
+```   
+
+##Sensitivity Analysis
+
+If treatment assignment cannot be assumed to be random in either of the steps, we can evaluate the robustness of the result with the sensitivity analyses. We can implement SA for the first step (with SA parameter $\Gamma_1$), for the second step (with SA parameter $\Gamma_2$) or for the combined p-value.
+
+\newpage
+
+We can construct a table to show values of $\Gamma_1$ and $\Gamma_2$ corresponding to non-significant p-values.
+
+```{r}
+#Table
+vectorGamma1 <- c(1, 1.5, 2, 2.1, 2.2, 2.3, 2.4, 2.5, 20)
+vectorGamma2 <- c(1, 1.25, 1.5, 20)
+
+matrixResult <- matrix(NA, 
+                       nrow = length(vectorGamma1),
+                       ncol = length(vectorGamma2))
+rownames(matrixResult) <- paste0("G1=",vectorGamma1)
+colnames(matrixResult) <- paste0("G2=",vectorGamma2)
+
+for( i_G1 in 1:length(vectorGamma1)) {
+  for( i_G2 in 1:length(vectorGamma2)) {
+     resTemp <- sensAnalysisEvFactors(matchedDat, matchedDat2,
+                                              "NTC", "TCI",
+                                              "ED_death", "ED_death",
+                                              "indexMatch", "indexMatch", 
+                                              Gamma1 = vectorGamma1[i_G1], Gamma2 = vectorGamma2[i_G2])$pvalue
+    matrixResult[i_G1,i_G2] <- sprintf("%.3f",resTemp)
+  }
+}
+
+matrixResult
+```
+
+Plot to show threshold in significance at $\alpha=0.05$ level in  $\Gamma_1$ and $\Gamma_2$ space.
+
+```{r, fig.width=6, fig.height=6, fig.path='figures/', dev=c('pdf')}
+#Look for limits of plots:
+
+#Smallest Gamma1 corresponding to alpha=0.05 at Gamma2 = Inf
+sensAnalysisEvFactors(matchedDat, matchedDat2,
+                      "NTC", "TCI",
+                      "ED_death", "ED_death",
+                      "indexMatch", "indexMatch",
+                      Gamma1 = 2.1867434, Gamma2 = 25)
+
+#Largest Gamma1 corresponding to alpha=0.05 at Gamma2 = 1
+sensAnalysisEvFactors(matchedDat, matchedDat2,
+                      "NTC", "TCI",
+                      "ED_death", "ED_death",
+                      "indexMatch", "indexMatch",
+                      Gamma1 = 2.24002, Gamma2 = 1)
+
+vectorGamma1_1 <- seq(2.1867434, 2.24002, length = 50)
+vectorGamma2_1 <- seq(1, 2, length = 50)
+grid_1 <- expand.grid(Gamma1 = vectorGamma1_1,
+                      Gamma2 = vectorGamma2_1)
+
+grid <- rbind(grid_1)
+
+grid$pvalue <- NA
+grid$threshold <- 0
+
+currentGamma2 <- grid$Gamma2[1]
+thresholdFound <- FALSE
+
+for( i in 1:nrow(grid)) {
+
+  if(grid$Gamma2[i]!=currentGamma2) {
+    currentGamma2 <- grid$Gamma2[i]
+    thresholdFound <- FALSE
+  }
+
+  if(thresholdFound == T) { next; }
+
+  resTemp <- sensAnalysisEvFactors(matchedDat, matchedDat2,
+                        "NTC", "TCI",
+                        "ED_death", "ED_death",
+                        "indexMatch", "indexMatch",
+                        Gamma1 = grid$Gamma1[i], Gamma2 = grid$Gamma2[i])
+  grid$pvalue[i] <- resTemp$pvalue
+
+  if(resTemp$pvalue>=.05 & thresholdFound==F ) {
+     grid$threshold[i] <- 1
+     thresholdFound <- T
+  }
+}
+
+
+par(mar=c(4,4,1,1))
+plot(NA,NA,
+      xlim = c(1,2.5), ylim = c(1,2.5),
+      xlab = expression(Gamma[MH]) ,
+      ylab = expression(Gamma[MN]),
+      main = "",
+      lwd = 1.5, type = "l", asp = 1)
+
+xMin <- min(grid$Gamma1[grid$threshold==1])
+xMax <- max(grid$Gamma1[grid$threshold==1])
+yMax <- max(grid$Gamma2[grid$threshold==1])
+yMin <- min(grid$Gamma2[grid$threshold==1])
+abline(h=1, v=1, lty = 2, col = "black")
+
+polygon(c(2.24002,xMax,grid$Gamma1[grid$threshold==1],xMin,xMin,3,3),
+        c(1,yMin,      grid$Gamma2[grid$threshold==1],yMax,3   ,3,1), col = "gray", border = NA)
+lines(grid$Gamma1[grid$threshold==1],
+      grid$Gamma2[grid$threshold==1], lwd = 1.5)
+lines(c(xMin,xMin), c(yMax,3), lwd = 1.5)
+lines(c(xMax,2.24002), c(yMin,1), lwd = 1.5)
+```
+
+##Computation of Sensitivity Value With Our Method
+
+Computation of sensitivity value of first evidence factor using our approach for MH test.
+
+```{r}
+#Fit conditional logistic regression model, with treatment as only
+# independent variable and ED mortality as outcome
+model <- clogit(ED_death ~ NTC + strata(indexMatch), 
+                data = matchedDat, method = "exact")
+summary(model)
+
+#One-sided 95%-level CI of odds ratio, Wald method
+ciWald <- exp(confint(model,level = .90))
+orL_Wald <- ciWald[1]
+orL_Wald
+
+
+#Verify: causal inference is robust to unobserved confounders characterized by
+# Gamma_MH up to the value of the lower bound of the CI.
+primalSensAnalysisOneToK(data = matchedDat,
+                          exposure = "NTC",
+                          outcome = "ED_death",
+                          indexMatch = "indexMatch",
+                          Gamma = 2)
+
+primalSensAnalysisOneToK(data = matchedDat,
+                          exposure = "NTC",
+                          outcome = "ED_death",
+                          indexMatch = "indexMatch",
+                          Gamma = 2.33)
+
+primalSensAnalysisOneToK(data = matchedDat,
+                          exposure = "NTC",
+                          outcome = "ED_death",
+                          indexMatch = "indexMatch",
+                          Gamma = 2.34)
+
+primalSensAnalysisOneToK(data = matchedDat,
+                          exposure = "NTC",
+                          outcome = "ED_death",
+                          indexMatch = "indexMatch",
+                          Gamma = 3)
+```
+
